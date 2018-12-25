@@ -10,6 +10,8 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 
+#include "fastcgi.h"
+
 
 #define HEAD_LEN                8  //消息头长度固定为8个字节
 #define BUFLEN                  4096
@@ -195,8 +197,7 @@ static const char *getParamValue(paramNameValue *nv, const char *paramName)
 
 int main(int argc, char *args[]){
 
-    int servfd, connfd;
-    int ret, i;
+    int servfd, connfd, ret, i;
     struct sockaddr_in servaddr, cliaddr;
     socklen_t slen, clen;
 
@@ -206,10 +207,9 @@ int main(int argc, char *args[]){
     paramNameValue *paramNV;
     bufStream bs;
 
-    int renderRet, rdlen;
-    int requestId, contentLen;
+    int renderRet, rdlen, requestId;
+	unsigned int contentLen, paramNameLen, paramValueLen;
     unsigned char paddingLen;
-    int paramNameLen, paramValueLen;
 
     char buf[BUFLEN];
 
@@ -271,15 +271,6 @@ int main(int argc, char *args[]){
             //读取消息头
             renderRet = renderNext(connfd, &header, HEAD_LEN, &bs);
 
-            if (renderRet == -1)
-            {
-                haltError("read", errno);
-            }
-            else if (renderRet == 0)
-            {
-                break;  // 读取结束
-            }
-
             headerBuf = header;
             requestId = (header.requestIdB1 << 8) + header.requestIdB0;
             contentLen = (header.contentLengthB1 << 8) + header.contentLengthB0;
@@ -298,7 +289,7 @@ int main(int argc, char *args[]){
                     printf("******************************* begin request *******************************\n");
 
                     //读取开始请求的请求体
-                    renderNext(connfd, &brBody, sizeof(brBody), bs);
+                    renderNext(connfd, &brBody, sizeof(brBody), &bs);
                     printf("role = %d, flags = %d\n", (brBody.roleB1 << 8) + brBody.roleB0, brBody.flags);
                     break;
 
@@ -322,12 +313,12 @@ int main(int argc, char *args[]){
                         */
 
                         //先读取一个字节，这个字节标识 paramName 的长度
-                        rdlen = renderNext(connfd, &c, 1, bs);
+                        rdlen = renderNext(connfd, &c, 1, &bs);
                         contentLen -= rdlen;
 
                         if ((c & 0x80) != 0)  //如果 c 的值大于 128，则该 paramName 的长度用四个字节表示
                         {
-                            rdlen = renderNext(connfd, lenbuf, 3, bs);
+                            rdlen = renderNext(connfd, lenbuf, 3, &bs);
                             contentLen -= rdlen;
                             paramNameLen = ((c & 0x7f) << 24) + (lenbuf[0] << 16) + (lenbuf[1] << 8) + lenbuf[2];
                         } else
@@ -336,11 +327,11 @@ int main(int argc, char *args[]){
                         }
 
                         // 同样的方式获取paramValue的长度
-                        rdlen = renderNext(connfd, &c, 1, bs);
+                        rdlen = renderNext(connfd, &c, 1, &bs);
                         contentLen -= rdlen;
                         if ((c & 0x80) != 0)
                         {
-                            rdlen = renderNext(connfd, lenbuf, 3, bs);
+                            rdlen = renderNext(connfd, lenbuf, 3, &bs);
                             contentLen -= rdlen;
                             paramValueLen = ((c & 0x7f) << 24) + (lenbuf[0] << 16) + (lenbuf[1] << 8) + lenbuf[2];
                         }
@@ -351,13 +342,13 @@ int main(int argc, char *args[]){
 
                         //读取paramName
                         param = (char *)calloc(paramNameLen + paramValueLen + 2, sizeof(char));
-                        rdlen = renderNext(connfd, param, paramNameLen, bs);
+                        rdlen = renderNext(connfd, param, paramNameLen, &bs);
                         contentLen -= rdlen;
 
                         param[paramNameLen] = '=';  // 用等号拼接
 
                         //读取paramValue
-                        rdlen = renderNext(connfd, param + paramValueLen + 1, paramValueLen, bs);
+                        rdlen = renderNext(connfd, param + paramNameLen + 1, paramValueLen, &bs);
                         contentLen -= rdlen;
 
                         printf("read param: %s\n", param);
@@ -368,13 +359,12 @@ int main(int argc, char *args[]){
                             extend_paramNV(paramNV);
                         }
 
-                        paramNV->param[paramNV->len] = param;
-                        param->len++;
+                        paramNV->param[paramNV->len++] = param;
                     }
 
                     if (paddingLen > 0)
                     {
-                        rdlen = renderNext(connfd, buf, paddingLen, bs);
+                        rdlen = renderNext(connfd, buf, paddingLen, &bs);
                         contentLen -= rdlen;
                     }
 
@@ -456,7 +446,7 @@ int main(int argc, char *args[]){
         headerBuf.type = FCGI_STDOUT;
 
         htmlHead = "Content-type: text/html\r\n\r\n";  //响应头
-        htmlBody = getParamValue(&paramNV, "SCRIPT_FILENAME");  // 把请求文件路径作为响应体返回
+        htmlBody = getParamValue(paramNV, "SCRIPT_FILENAME");  // 把请求文件路径作为响应体返回
 
         printf("html: %s%s\n",htmlHead, htmlBody);
 
@@ -464,7 +454,7 @@ int main(int argc, char *args[]){
 
         headerBuf.contentLengthB1 = (contentLen >> 8) & 0xff;
         headerBuf.contentLengthB0 = contentLen & 0xff;
-        headerBuf.paddingLength = (contentLen % 8) > 0 ? 8 - (contentLen % 8) : 0;  // 让数据 8 字节对齐
+        headerBuf.paddingLength = (contentLen & 7) > 0 ? (8 - (contentLen & 7)) : 0;  // 填充数据让数据8字节对齐
 
 
         write(connfd, &headerBuf, HEAD_LEN);
@@ -473,10 +463,10 @@ int main(int argc, char *args[]){
 
         if (headerBuf.paddingLength > 0)
         {
-            write(connfd, buf, headerBuf.paddingLength);  //填充数据随便写什么，数据会被服务器忽略
+            write(connfd, buf, headerBuf.paddingLength);  //填充数据随便写什么，数据会被对端忽略
         }
 
-        free_paramNV(&paramNV);
+        free_paramNV(paramNV);
 
         //回写一个空的 FCGI_STDOUT 表明 该类型消息已发送结束
         headerBuf.type = FCGI_STDOUT;
