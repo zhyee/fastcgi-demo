@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
 
 #include "fastcgi.h"
 
@@ -93,9 +94,9 @@ typedef struct bufStream {
 
 
 // 打印错误并退出
-void haltError(const char *errtype, int errno)
+void haltError(const char *prefix, int errerno)
 {
-    fprintf(stderr, "%s: %s\n", errtype, strerror(errno));
+    fprintf(stderr, "%s: %s\n", prefix, strerror(errerno));
     exit(EXIT_FAILURE);
 }
 
@@ -107,7 +108,7 @@ static int readNext(int fd, bufStream *bs)
     return bs->readLen;
 }
 
-static void renderNext(int fd, char *buf, int bufLen, bufStream *bs)
+static int renderNext(int fd, char *buf, int bufLen, bufStream *bs)
 {
     int remain = bufLen;
     while (remain > 0)
@@ -121,6 +122,8 @@ static void renderNext(int fd, char *buf, int bufLen, bufStream *bs)
             {
                 if (errno == EINTR) {
                     continue;
+                } else if (errno == EAGAIN) {
+                    return 0;  // 数据已经读完
                 } else {
                     return -1; //读取出错
                 }
@@ -158,11 +161,12 @@ static paramNameValue *create_paramNV(unsigned int cap)
     return nv;
 }
 
-// 扩充一个结键值构体的容量为之前的两倍
-static void extend_paramNV(paramNameValue *nv)
+// 扩充一个键值结构体的容量为之前的两倍
+static paramNameValue *extend_paramNV(paramNameValue *nv)
 {
     nv->cap <<= 1;
     nv = realloc(nv, sizeof(paramNameValue) + nv->cap * sizeof(char *));
+    return nv;
 }
 
 // 释放一个键值结构体
@@ -187,7 +191,7 @@ static const char *getParamValue(paramNameValue *nv, const char *paramName)
     {
         if (nv->param[i][strlen(paramName)] == '=' && strncmp(paramName, nv->param[i], strlen(paramName)) == 0)
         {
-            return nv->pvalue[i] + strlen(paramName) + 1;
+            return nv->param[i] + strlen(paramName) + 1;
         }
     }
 
@@ -265,11 +269,17 @@ int main(int argc, char *args[]){
             break;
         }
 
+        fcntl(connfd, F_SETFL, O_NONBLOCK);
+
         paramNV = create_paramNV(16);
 
         while (1) {
             //读取消息头
-            renderRet = renderNext(connfd, &header, HEAD_LEN, &bs);
+            renderRet = renderNext(connfd, (char *)&header, HEAD_LEN, &bs);
+
+            if (renderRet <= 0) {
+                break;
+            }
 
             headerBuf = header;
             requestId = (header.requestIdB1 << 8) + header.requestIdB0;
@@ -289,7 +299,7 @@ int main(int argc, char *args[]){
                     printf("******************************* begin request *******************************\n");
 
                     //读取开始请求的请求体
-                    renderNext(connfd, &brBody, sizeof(brBody), &bs);
+                    renderNext(connfd, (char *)&brBody, sizeof(brBody), &bs);
                     printf("role = %d, flags = %d\n", (brBody.roleB1 << 8) + brBody.roleB0, brBody.flags);
                     break;
 
@@ -356,7 +366,7 @@ int main(int argc, char *args[]){
                         if (paramNV->len == paramNV->cap)
                         {
                             // 如果键值结构体已满则把容量扩充一倍
-                            extend_paramNV(paramNV);
+                            paramNV = extend_paramNV(paramNV);
                         }
 
                         paramNV->param[paramNV->len++] = param;
@@ -384,41 +394,11 @@ int main(int argc, char *args[]){
                         {
                             if (contentLen > BUFLEN)
                             {
-                                rdlen = read(connfd, buf, BUFLEN);
+                                rdlen = renderNext(connfd, buf, BUFLEN, &bs);
                             }
                             else
                             {
-                                rdlen = read(connfd, buf, contentLen);
-                            }
-
-                            contentLen -= rdlen;
-                            fwrite(buf, sizeof(char), rdlen, stdout);
-                        }
-                        printf("\n");
-                    }
-
-                    if (paddingLen > 0)
-                    {
-                        rdlen = read(connfd, buf, paddingLen);
-                        contentLen -= rdlen;
-                    }
-
-                    break;
-
-                case FCGI_DATA:
-                    printf("begin read data....\n");
-
-                    if (contentLen > 0)
-                    {
-                        while (contentLen > 0)
-                        {
-                            if (contentLen > BUFLEN)
-                            {
-                                rdlen = read(connfd, buf, BUFLEN);
-                            }
-                            else
-                            {
-                                rdlen = read(connfd, buf, contentLen);
+                                rdlen = renderNext(connfd, buf, contentLen, &bs);
                             }
 
                             contentLen -= rdlen;
@@ -446,7 +426,7 @@ int main(int argc, char *args[]){
         headerBuf.type = FCGI_STDOUT;
 
         htmlHead = "Content-type: text/html\r\n\r\n";  //响应头
-        htmlBody = getParamValue(paramNV, "SCRIPT_FILENAME");  // 把请求文件路径作为响应体返回
+        htmlBody = (char *)getParamValue(paramNV, "SCRIPT_FILENAME");  // 把请求文件路径作为响应体返回
 
         printf("html: %s%s\n",htmlHead, htmlBody);
 
