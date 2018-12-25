@@ -2,14 +2,13 @@
 // Created by root on 12/26/17.
 //
 
-#include <sys/socket.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
-#include <netinet/in.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/socket.h>
 
 
 #define HEAD_LEN                8  //消息头长度固定为8个字节
@@ -17,10 +16,8 @@
 #define FCGI_VERSION_1           1  //版本号
 
 
-
-
 // 消息类型
-enum fcgi_request_type {
+typedef enum fcgi_request_type {
     FCGI_BEGIN_REQUEST      = 1,
     FCGI_ABORT_REQUEST      = 2,
     FCGI_END_REQUEST        = 3,
@@ -32,17 +29,17 @@ enum fcgi_request_type {
     FCGI_GET_VALUES         = 9,
     FCGI_GET_VALUES_RESULT  = 10,
     FCGI_UNKOWN_TYPE        = 11
-};
+} fcgi_request_type;
 
 // 服务器希望fastcgi程序充当的角色, 这里只讨论 FCGI_RESPONDER 响应器角色
-enum fcgi_role {
+typedef enum fcgi_role {
     FCGI_RESPONDER      = 1,
     FCGI_AUTHORIZER     = 2,
     FCGI_FILTER         = 3
-};
+} fcgi_role;
 
 //消息头
-struct fcgi_header {
+typedef struct fcgi_header {
     unsigned char version;
     unsigned char type;
     unsigned char requestIdB1;
@@ -51,96 +48,144 @@ struct fcgi_header {
     unsigned char contentLengthB0;
     unsigned char paddingLength;
     unsigned char reserved;
-};
+} fcgi_header;
 
 //请求开始发送的消息体
-struct FCGI_BeginRequestBody {
+typedef struct FCGI_BeginRequestBody {
     unsigned char roleB1;
     unsigned char roleB0;
     unsigned char flags;
     unsigned char reserved[5];
-};
+} FCGI_BeginRequestBody;
 
 //请求结束发送的消息体
-struct FCGI_EndRequestBody {
+typedef struct FCGI_EndRequestBody {
     unsigned char appStatusB3;
     unsigned char appStatusB2;
     unsigned char appStatusB1;
     unsigned char appStatusB0;
     unsigned char protocolStatus;
     unsigned char reserved[3];
-};
+} FCGI_EndRequestBody;
 
 // protocolStatus
-enum protocolStatus {
+typedef enum protocolStatus {
     FCGI_REQUEST_COMPLETE = 0,
     FCGI_CANT_MPX_CONN = 1,
     FCGI_OVERLOADED = 2,
     FCGI_UNKNOWN_ROLE = 3
-};
+} protocolStatus;
+
+// 存储键值对的结构体
+typedef struct paramNameValue {
+    unsigned int cap;  // 能存储的键值对容量
+    unsigned int len;    // 当前已存储的键值对数量
+    char *param[0];  //使用柔性数组  "name=value" 格式
+} paramNameValue;
+
+typedef struct bufStream {
+    int readLen;
+    int renderPos;
+    char buf[BUFLEN];
+} bufStream;
 
 
 // 打印错误并退出
-void haltError(char *type, int errnum)
+void haltError(const char *errtype, int errno)
 {
-    fprintf(stderr, "%s: %s\n", type, strerror(errnum));
+    fprintf(stderr, "%s: %s\n", errtype, strerror(errno));
     exit(EXIT_FAILURE);
 }
 
-// 存储键值对的结构体
-struct paramNameValue {
-    char **pname;
-    char **pvalue;
-    int maxLen;
-    int curLen;
-};
+static int readNext(int fd, bufStream *bs)
+{
+    bs->renderPos = 0;
+    bzero(bs->buf, BUFLEN);
+    bs->readLen = read(fd, bs->buf, BUFLEN);
+    return bs->readLen;
+}
 
+static void renderNext(int fd, char *buf, int bufLen, bufStream *bs)
+{
+    int remain = bufLen;
+    while (remain > 0)
+    {
+        bufLen = remain;
 
+        while (bs->readLen <= bs->renderPos)
+        {
+            readNext(fd, bs);
+            if (bs->readLen == -1)
+            {
+                if (errno == EINTR) {
+                    continue;
+                } else {
+                    return -1; //读取出错
+                }
+            }
+            if (bs->readLen == 0)
+            {
+                return 0;  // EOF
+            }
+        }
 
+        if (bufLen > (bs->readLen - bs->renderPos))
+        {
+            bufLen = bs->readLen - bs->renderPos;
+        }
+
+        memcpy(buf, bs->buf + bs->renderPos, bufLen);
+        bs->renderPos += bufLen;
+        remain -= bufLen;
+    }
+    return bufLen;
+}
 
 // 初始化一个键值结构体
-void init_paramNV(struct paramNameValue *nv)
+static paramNameValue *create_paramNV(unsigned int cap)
 {
-    nv->maxLen = 16;
-    nv->curLen = 0;
-    nv->pname = (char **)malloc(nv->maxLen * sizeof(char *));
-    nv->pvalue = (char **)malloc(nv->maxLen * sizeof(char *));
+    // 容量最小为8，并且2的整数次幂对齐
+    unsigned int size = 8;
+    while (size < cap) {
+        size <<= 1;
+    }
+
+    paramNameValue *nv = malloc(sizeof(paramNameValue) + sizeof(char *) * size);
+    nv->cap = size;
+    nv->len = 0;
+    return nv;
 }
 
 // 扩充一个结键值构体的容量为之前的两倍
-void extend_paramNV(struct paramNameValue *nv)
+static void extend_paramNV(paramNameValue *nv)
 {
-    nv->maxLen *= 2;
-    nv->pname = realloc(nv->pname, nv->maxLen * sizeof(char *));
-    nv->pvalue = realloc(nv->pvalue, nv->maxLen * sizeof(char *));
+    nv->cap <<= 1;
+    nv = realloc(nv, sizeof(paramNameValue) + nv->cap * sizeof(char *));
 }
 
 // 释放一个键值结构体
-void free_paramNV(struct paramNameValue *nv)
+static void free_paramNV(paramNameValue *nv)
 {
     int i;
 
-    for(i = 0; i < nv->curLen; i++)
+    for(i = 0; i < nv->len; i++)
     {
-        free(nv->pname[i]);
-        free(nv->pvalue[i]);
+        free(nv->param[i]);
     }
-    free(nv->pname);
-    free(nv->pvalue);
+    free(nv);
 }
 
 
 // 获取指定 paramName 的值
-char *getParamValue(struct paramNameValue *nv, char *paramName)
+static const char *getParamValue(paramNameValue *nv, const char *paramName)
 {
 
     int i;
-
-    for(i = 0; i < nv->curLen; i++)
+    for(i = 0; i < nv->len; i++)
     {
-        if (strncmp(paramName, nv->pname[i], strlen(paramName)) == 0)
+        if (nv->param[i][strlen(paramName)] == '=' && strncmp(paramName, nv->param[i], strlen(paramName)) == 0)
         {
-            return nv->pvalue[i];
+            return nv->pvalue[i] + strlen(paramName) + 1;
         }
     }
 
@@ -148,19 +193,20 @@ char *getParamValue(struct paramNameValue *nv, char *paramName)
 }
 
 
-int main(){
+int main(int argc, char *args[]){
 
     int servfd, connfd;
     int ret, i;
     struct sockaddr_in servaddr, cliaddr;
     socklen_t slen, clen;
 
-    struct fcgi_header header, headerBuf;
-    struct FCGI_BeginRequestBody brBody;
-    struct paramNameValue  paramNV;
-    struct FCGI_EndRequestBody erBody;
+    fcgi_header header, headerBuf;
+    FCGI_BeginRequestBody brBody;
+    FCGI_EndRequestBody erBody;
+    paramNameValue *paramNV;
+    bufStream bs;
 
-    ssize_t rdlen;
+    int renderRet, rdlen;
     int requestId, contentLen;
     unsigned char paddingLen;
     int paramNameLen, paramValueLen;
@@ -169,9 +215,9 @@ int main(){
 
     unsigned char c;
     unsigned char lenbuf[3];
-    char *paramName, *paramValue;
-
-    char *htmlHead, *htmlBody;
+    char *param,
+         *htmlHead,
+         *htmlBody;
 
 
     /*socket bind listen*/
@@ -187,7 +233,9 @@ int main(){
 
     bzero(&servaddr, slen);
 
-    //这里让 fastcgi程序监听 127.0.0.1:9000  和 php-fpm 监听的地址相同， 方便我们用 nginx 来测试
+    /**
+     * 这里让程序监听 127.0.0.1:9000,  和 php-fpm 监听相同的端口， 方便我们用 nginx 来配合测试
+     */
     servaddr.sin_family = AF_INET;
     servaddr.sin_port = htons(9000);
     servaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -217,36 +265,22 @@ int main(){
             break;
         }
 
-        fcntl(connfd, F_SETFL, O_NONBLOCK); // 设置socket为非阻塞
-
-        init_paramNV(&paramNV);
+        paramNV = create_paramNV(16);
 
         while (1) {
-
             //读取消息头
-            bzero(&header, HEAD_LEN);
-            rdlen = read(connfd, &header, HEAD_LEN);
+            renderRet = renderNext(connfd, &header, HEAD_LEN, &bs);
 
-            if (rdlen == -1)
+            if (renderRet == -1)
             {
-                // 无数据可读
-                if (errno == EAGAIN)
-                {
-                    break;
-                }
-                else
-                {
-                    haltError("read", errno);
-                }
+                haltError("read", errno);
             }
-
-            if (rdlen == 0)
+            else if (renderRet == 0)
             {
-                break; //消息读取结束
+                break;  // 读取结束
             }
 
             headerBuf = header;
-
             requestId = (header.requestIdB1 << 8) + header.requestIdB0;
             contentLen = (header.contentLengthB1 << 8) + header.contentLengthB0;
             paddingLen = header.paddingLength;
@@ -264,11 +298,8 @@ int main(){
                     printf("******************************* begin request *******************************\n");
 
                     //读取开始请求的请求体
-                    bzero(&brBody, sizeof(brBody));
-                    read(connfd, &brBody, sizeof(brBody));
-
+                    renderNext(connfd, &brBody, sizeof(brBody), bs);
                     printf("role = %d, flags = %d\n", (brBody.roleB1 << 8) + brBody.roleB0, brBody.flags);
-
                     break;
 
                 case FCGI_PARAMS:
@@ -283,19 +314,20 @@ int main(){
                     //循环读取键值对
                     while (contentLen > 0)
                     {
-                        /*
-                        FCGI_PARAMS 以键值对的方式传送，键和值之间没有'=',每个键值对之前会分别用1或4个字节来标识键和值的长度 例如：
-                        \x0B\x02SERVER_PORT80\x0B\x0ESERVER_ADDR199.170.183.42
-                         上面的长度是用十六进制表示的  \x0B = 11  正好为SERVER_PORT的长度， \x02 = 2 为80的长度
+
+                        /**
+                        * FCGI_PARAMS 以键值对的方式传送，键和值之间没有'=',每个键值对之前会分别用1或4个字节来标识键和值的长度
+                        * 例如: \x0B\x02SERVER_PORT80\x0B\x0ESERVER_ADDR199.170.183.42
+                        * 上面的长度是十六进制的  \x0B = 11  正好为字符串 "SERVER_PORT" 的长度， \x02 = 2 为字符串 "80" 的长度
                         */
 
-                        // 获取paramName的长度
-                        rdlen = read(connfd, &c, 1);  //先读取一个字节，这个字节标识 paramName 的长度
+                        //先读取一个字节，这个字节标识 paramName 的长度
+                        rdlen = renderNext(connfd, &c, 1, bs);
                         contentLen -= rdlen;
 
                         if ((c & 0x80) != 0)  //如果 c 的值大于 128，则该 paramName 的长度用四个字节表示
                         {
-                            rdlen = read(connfd, lenbuf, 3);
+                            rdlen = renderNext(connfd, lenbuf, 3, bs);
                             contentLen -= rdlen;
                             paramNameLen = ((c & 0x7f) << 24) + (lenbuf[0] << 16) + (lenbuf[1] << 8) + lenbuf[2];
                         } else
@@ -304,11 +336,11 @@ int main(){
                         }
 
                         // 同样的方式获取paramValue的长度
-                        rdlen = read(connfd, &c, 1);
+                        rdlen = renderNext(connfd, &c, 1, bs);
                         contentLen -= rdlen;
                         if ((c & 0x80) != 0)
                         {
-                            rdlen = read(connfd, lenbuf, 3);
+                            rdlen = renderNext(connfd, lenbuf, 3, bs);
                             contentLen -= rdlen;
                             paramValueLen = ((c & 0x7f) << 24) + (lenbuf[0] << 16) + (lenbuf[1] << 8) + lenbuf[2];
                         }
@@ -318,32 +350,31 @@ int main(){
                         }
 
                         //读取paramName
-                        paramName = (char *)calloc(paramNameLen + 1, sizeof(char));
-                        rdlen = read(connfd, paramName, paramNameLen);
+                        param = (char *)calloc(paramNameLen + paramValueLen + 2, sizeof(char));
+                        rdlen = renderNext(connfd, param, paramNameLen, bs);
                         contentLen -= rdlen;
+
+                        param[paramNameLen] = '=';  // 用等号拼接
 
                         //读取paramValue
-                        paramValue = (char *)calloc(paramValueLen + 1, sizeof(char));
-                        rdlen = read(connfd, paramValue, paramValueLen);
+                        rdlen = renderNext(connfd, param + paramValueLen + 1, paramValueLen, bs);
                         contentLen -= rdlen;
 
-                        printf("read param: %s=%s\n", paramName, paramValue);
+                        printf("read param: %s\n", param);
 
-                        if (paramNV.curLen == paramNV.maxLen)
+                        if (paramNV->len == paramNV->cap)
                         {
                             // 如果键值结构体已满则把容量扩充一倍
-                            extend_paramNV(&paramNV);
+                            extend_paramNV(paramNV);
                         }
 
-                        paramNV.pname[paramNV.curLen] = paramName;
-                        paramNV.pvalue[paramNV.curLen] = paramValue;
-                        paramNV.curLen++;
-
+                        paramNV->param[paramNV->len] = param;
+                        param->len++;
                     }
 
                     if (paddingLen > 0)
                     {
-                        rdlen = read(connfd, buf, paddingLen);
+                        rdlen = renderNext(connfd, buf, paddingLen, bs);
                         contentLen -= rdlen;
                     }
 
