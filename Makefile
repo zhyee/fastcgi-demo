@@ -1,7 +1,10 @@
+CC=gcc
+TARGET=fastcgi
+
 all:
-	gcc fastcgi.c -o fastcgi
+	${CC} fastcgi.c -o ${TARGET}
 
 .PHONY: clean
 
 clean:
-	rm -f fastcgi
+	rm -f *.o ${TARGET}
