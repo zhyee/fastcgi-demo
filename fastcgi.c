@@ -86,11 +86,11 @@ typedef struct paramNameValue {
     char *param[0];  //使用柔性数组  "name=value" 格式
 } paramNameValue;
 
-typedef struct bufStream {
+typedef struct readBuffer {
     int readLen;
     int renderPos;
     char buf[BUFLEN];
-} bufStream;
+} readBuffer;
 
 
 // 打印错误并退出
@@ -100,7 +100,7 @@ void haltError(const char *prefix, int errerno)
     exit(EXIT_FAILURE);
 }
 
-static int readNext(int fd, bufStream *bs)
+static int readNext(int fd, readBuffer *bs)
 {
     bs->renderPos = 0;
     bzero(bs->buf, BUFLEN);
@@ -108,7 +108,7 @@ static int readNext(int fd, bufStream *bs)
     return bs->readLen;
 }
 
-static int renderNext(int fd, char *buf, int bufLen, bufStream *bs)
+static int renderNext(int fd, char *buf, int bufLen, readBuffer *bs)
 {
     int remain = bufLen;
     while (remain > 0)
@@ -209,7 +209,7 @@ int main(int argc, char *args[]){
     FCGI_BeginRequestBody brBody;
     FCGI_EndRequestBody erBody;
     paramNameValue *paramNV;
-    bufStream bs;
+    readBuffer bs;
 
     int renderRet, rdlen, requestId;
 	unsigned int contentLen, paramNameLen, paramValueLen;
