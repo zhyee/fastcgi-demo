@@ -409,7 +409,7 @@ int main(int argc, char *args[]){
 
                     if (paddingLen > 0)
                     {
-                        rdlen = read(connfd, buf, paddingLen);
+                        rdlen = renderNext(connfd, buf, paddingLen, &bs);
                         contentLen -= rdlen;
                     }
 
